@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>motion-video demo scene</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0b0e14; overflow: hidden; }
+  #stage {
+    position: relative; width: 1920px; height: 1080px; overflow: hidden;
+    background:
+      radial-gradient(1100px 620px at 50% 34%, #16203a 0%, #0c111c 55%, #080a10 100%);
+    font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+    transform-origin: 50% 46%;
+  }
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(120,170,255,.055) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(120,170,255,.055) 1px, transparent 1px);
+    background-size: 80px 80px;
+    mask-image: radial-gradient(760px 520px at 50% 40%, #000 25%, transparent 78%);
+    -webkit-mask-image: radial-gradient(760px 520px at 50% 40%, #000 25%, transparent 78%);
+  }
+  #title {
+    position: absolute; left: 0; right: 0; top: 400px;
+    display: flex; justify-content: center; gap: 6px;
+    font-size: 168px; font-weight: 800; letter-spacing: 4px;
+    color: #eaf1ff; text-shadow: 0 0 60px rgba(96,150,255,.35);
+  }
+  #title span { display: inline-block; will-change: transform, opacity; }
+  .sub {
+    position: absolute; left: 0; right: 0; top: 610px; text-align: center;
+    font-size: 30px; letter-spacing: 14px; color: #7f9dcb; text-transform: uppercase;
+  }
+  .bar {
+    position: absolute; left: 50%; top: 700px; width: 520px; height: 4px;
+    margin-left: -260px; border-radius: 4px; background: rgba(130,170,255,.14); overflow: hidden;
+  }
+  .bar b {
+    display: block; width: 100%; height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, #4f7dff, #6ee7ff);
+    transform-origin: 0 50%; transform: scaleX(0);
+  }
+  .dots {
+    position: absolute; left: 50%; top: 780px; margin-left: -60px;
+    display: flex; gap: 34px;
+  }
+  .dots i {
+    display: block; width: 26px; height: 26px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #9ec2ff, #3f6fe0);
+    box-shadow: 0 0 26px rgba(90,140,255,.55);
+    transform: scale(0); will-change: transform, opacity;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="grid"></div>
+  <div id="title"></div>
+  <div class="sub">frame exact</div>
+  <div class="bar"><b></b></div>
+  <div class="dots"><i></i><i></i><i></i></div>
+</div>
+
+<script>
+/* ---- 纯函数动画：一切画面状态只由 t 决定 -------------------------------
+   seek(t) 里不读时钟、不用 rAF、不留随机数 → 同一 t 永远同一帧。
+   这是 render.mjs 能逐帧驱动、audit.mjs 能机器验收的前提。            */
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const seg = (t, a, b) => clamp01((t - a) / (b - a));      // 把 t 映射成 0..1 段进度
+const lerp = (a, b, k) => a + (b - a) * k;
+
+const easeOutCubic   = (k) => 1 - Math.pow(1 - k, 3);
+const easeInOutCubic = (k) => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+const easeOutBack    = (k) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(k - 1, 3) + c1 * Math.pow(k - 1, 2); };
+
+const stage  = document.getElementById('stage');
+const titleEl = document.getElementById('title');
+const subEl  = document.querySelector('.sub');
+const barEl  = document.querySelector('.bar b');
+const dots   = [...document.querySelectorAll('.dots i')];
+
+titleEl.innerHTML = [...'MOTION'].map((c) => `<span>${c}</span>`).join('');
+const spans = [...titleEl.querySelectorAll('span')];
+
+window.scene = {
+  duration: 3.0,
+  fps: 30,
+  width: 1920,
+  height: 1080,
+  ready: true,
+
+  seek(t) {
+    // 标题：0.15s 起逐字上浮，字间错开 75ms
+    spans.forEach((el, i) => {
+      const k = easeOutCubic(seg(t, 0.15 + i * 0.075, 0.85 + i * 0.075));
+      el.style.transform = `translateY(${lerp(96, 0, k)}px)`;
+      el.style.opacity = k.toFixed(4);
+    });
+
+    // 副标题：0.90–1.50 淡入 + 上移
+    const ks = easeOutCubic(seg(t, 0.90, 1.50));
+    subEl.style.opacity = ks.toFixed(4);
+    subEl.style.transform = `translateY(${lerp(20, 0, ks)}px)`;
+
+    // 进度线：0.30–2.40 从左铺满（用 scaleX，不触发重排）
+    const kb = easeInOutCubic(seg(t, 0.30, 2.40));
+    barEl.style.transform = `scaleX(${kb.toFixed(4)})`;
+
+    // 三个点：1.50s 起回弹弹出，间隔 150ms
+    dots.forEach((el, i) => {
+      const kd = easeOutBack(seg(t, 1.50 + i * 0.15, 1.85 + i * 0.15));
+      el.style.transform = `scale(${kd.toFixed(4)})`;
+      el.style.opacity = clamp01(kd).toFixed(4);
+    });
+
+    // 收尾：2.40–3.00 整体轻微推近，留出定格
+    const ke = easeInOutCubic(seg(t, 2.40, 3.00));
+    stage.style.transform = `scale(${lerp(1, 1.028, ke).toFixed(5)})`;
+  },
+};
+</script>
+</body>
+</html>

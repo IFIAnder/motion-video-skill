@@ -1,0 +1,169 @@
+# 失败模式手册：症状 → 原因 → 修法
+
+按 `audit.mjs` 的报错对号入座。每条都给出了"机器怎么发现的"，因为
+知道机器在看什么，你才能一次改对。
+
+---
+
+## A. `✖ FAIL [motion] 画面没有动`
+
+**机器看到**：全场变化像素 ≈ 0，局部最大灰度差 < 12。
+
+**原因**（按出现频率）：
+
+1. `seek(t)` 写了，但没有一处真正改动 DOM/Canvas —— 只改了内部变量（`this._t = t`）
+2. 动画写在 `requestAnimationFrame` 里，`seek` 完全没接管
+3. 动画是 CSS `@keyframes` 自动播放：渲染器虽然会 `pause()` 并设 `currentTime`，
+   但如果是 `animation: ... infinite` 且用了 `animation-play-state` 之类，可能被绕过
+4. 所有元素 `opacity: 0`（入场函数写错，`seg` 的分母为 0 → 恒为 0 或 NaN）
+5. 元素在视口外（`top: -2000px`）、或父容器 `height: 0`
+6. `#stage` 被别的元素完全盖住
+
+**修**：
+
+```js
+seek(t) {
+  const k = easeOutCubic(seg(t, 0.2, 1.0));
+  el.style.opacity = String(k);                       // ← 必须真的写到 DOM
+  el.style.transform = `translateY(${lerp(40, 0, k)}px)`;
+}
+```
+
+先只让**一个**元素动起来，跑 `--still 0.1,0.9` 对比两张图。动了再往下做。
+
+---
+
+## B. `⚠ WARN [static] N 段中段静止：1.10–2.57s`
+
+**机器看到**：连续 ≥0.55s 的两个指标都极低，且不在片头片尾。
+
+**这是本 skill 最核心要抓的问题。** 原因几乎总是一样：
+
+- 只写了入场（`enter`）和退场（`exit`）函数，`active` 段没有持续变化的属性
+- 或者有，但缓动在段末过早收敛（`easeOutExpo` 在 k=0.9 时已到 0.999，后半段视觉上不动）
+- 或者元素的"持续变化"是小幅度的（细线移动），在缩略图上低于阈值 —— 这种情况 audit
+  会同时给出很低的变化像素但较高的局部灰度差，**如果 maxGray 也不高，就是真的没动**
+
+**修**：
+
+1. 回到时间轴表，检查 active 区间里那个元素**到底在变什么**。如果答案是"什么都没变"，
+   那就是设计问题：让它变点什么（描边进度、计数器、微位移、高光扫过、粒子流动）。
+2. 如果本来就该停（例如"标题就位后停 1 秒再出场"），在 storyboard 的节奏图里标注停留，
+   交付时明说这是设计内的。
+3. 如果动得太细看不见，放大变化幅度，而不是骗过检测。
+
+---
+
+## C. `⚠ WARN [jump] N 处硬跳变`
+
+**机器看到**：某帧变化像素是基线的 5 倍以上，局部灰度差 > 45。
+
+**原因**：
+
+1. 位置分两段写，中间没有过渡（`if (t < 1) x = 0; else x = 400;`）
+2. `easeOutBack`/`spring` 幅度过大导致过冲，看起来像跳
+3. 元素在某一帧被 `display: none` → `block`
+4. 逐帧重算但用了取整（`Math.round`），大步长时会出现台阶
+5. 模板字符串里 `toFixed` 精度太低（`k.toFixed(1)` 在 300 帧下只有 11 个台阶）
+
+**修**：
+
+```js
+// 错：分段常量
+const x = t < 1 ? 0 : 400;
+// 对：插值
+const x = lerp(0, 400, easeInOutCubic(seg(t, 0.8, 1.2)));
+```
+- 透明度/位移/缩放保留 3–4 位小数：`k.toFixed(4)`，不要 `toFixed(1)`
+- `display` 切换用 `opacity` + `visibility` 代替
+
+---
+
+## D. `⚠ WARN [flat] 整片 / N 帧近乎纯色`
+
+**机器看到**：帧内灰度标准差 < 1 且极差 < 5。
+
+**原因**：
+
+- 整片：HTML 压根没渲染出来（选择器拼错、父容器 `height:0`、`position:fixed` 跑到外面）
+- 部分帧：元素进场太晚 / 提前退场 / 该段是纯背景
+- 元素为 `opacity:0` 但检测看的是像素，不区分"透明"和"没有"
+
+**修**：先用 `--still` 抽那几帧单独看。整片纯色时，把 HTML 里所有 `opacity` 临时改成 1 跑一次
+（`--still 1.0`），确认结构在，再恢复。
+
+---
+
+## E. `⚠ WARN [flicker] 动了立刻又静止 N 次`
+
+**机器看到**：局部灰度差 > 30 的帧之后紧跟 < 8 的帧，反复出现。
+
+**原因**（顺序排查）：
+
+1. 用了 `Math.random()` —— 每帧不同
+2. 用了 `Date.now()` / `performance.now()` 做驱动
+3. `seek` 里修改了会累积的状态（`count++`、`array.push`、清空的缓存）
+4. 每帧重建 DOM（`innerHTML = ...`），导致文字重排后像素抖动
+5. 有两套驱动同时在跑（自己的 rAF + 渲染器的 seek）
+
+**修**：`seek` 必须是**幂等**的 —— 用同一个 t 调两次，画面完全相同。
+自测方法：
+
+```js
+scene.seek(1.5); const a = stage.innerHTML;
+scene.seek(0.2); scene.seek(1.5); const b = stage.innerHTML;
+console.log(a === b);   // 必须是 true
+```
+（对 Canvas 用 `toDataURL()` 对比）
+
+---
+
+## F. `⚠ WARN [loop] 首末帧不一致`
+
+**机器看到**：`--loop` 时末帧与首帧差异显著。
+
+**原因**：末帧时刻算错。总帧数 `n = round(duration * fps)`，
+**最后一帧的时刻是 `(n-1)/fps`，不是 `duration`**。
+一个 3s@30fps 的循环，第 89 帧是 2.9667s，第 90 帧（t=3.0）与 t=0 相同，但它不被渲染。
+
+**修**：循环动效的设计方式 —— 所有周期性函数用 `t / duration` 的相位，
+并保证 `f(0) === f(duration)`：
+
+```js
+const phase = (t / duration) % 1;
+const k = phase < 0.5 ? phase * 2 : 2 - phase * 2;   // 三角波，首末相接
+```
+
+---
+
+## G. 文字溢出 / 撞色 / 看不清
+
+**机器看不出来**（audit 只看"有没有变"），必须人眼。
+
+**修**：
+
+- 四边留 80px 安全区（1920x1080 下），字号大时留更多
+- 暗底（#0b0e14）上文字最暗不要低于 #6d8bbd；想更暗就用字号/字重补
+- 中文字体回退链：`"Segoe UI", "Microsoft YaHei", Arial` —— 只写 `Arial` 时中文会掉到宋体
+- 大标题加 `letter-spacing`（2–6px），中文标题加 4–10px 更显呼吸
+
+---
+
+## H. 渲染很慢
+
+- 1920x1080 约 90ms/帧 → 3 秒 30fps ≈ 8 秒。可接受。
+- 慢的主因：`ctx.shadowBlur`（每帧重算模糊）、大量 DOM 重建、`filter: blur()`、
+  `getTotalLength()`/`getBoundingClientRect()` 写在 `seek` 里
+- 想更快：先 `--still` 只出 3 帧看构图；确认后整片只渲一次
+- 想更锐：`--scale 2`（渲染 3840x2160 再缩到 1080p），代价 3–4 倍时间
+
+---
+
+## I. 交付检查（最后一遍）
+
+```bash
+node scripts/audit.mjs --video out/v.mp4 --fps 30 --duration 3 --width 1920 --height 1080
+```
+- `FAIL` → 不许交付
+- 每条 `WARN` → 要么改，要么在交付说明里写"设计内的，因为…"
+- 看一眼 `-sheet.png`：9 宫格应该能讲出这个片子在干什么；讲不出来说明镜头信息量太低

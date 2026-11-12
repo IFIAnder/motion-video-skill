@@ -4,7 +4,8 @@
 > 目标不是"让模型写得更漂亮"，而是**把动画变成可被机器判定的工程物**——
 > 让"我以为我写了动效"这件事，在交付前被机器拆穿。
 
-零 npm 依赖。只需要 Chrome/Edge + ffmpeg + Node。
+零 npm 依赖。只需要 Chrome/Edge + ffmpeg + ffprobe + Node。
+（ffprobe 只在 `audit` 校验分辨率/时长时用。缺了不会静默放行——声明了 `--width/--height/--duration` 就直接 FAIL，没声明则 WARN。）
 
 ---
 
@@ -29,7 +30,7 @@
 
 ```bash
 # 1. 安装（skill 目录）
-git clone https://github.com/IFIAnder/ds-motion-video-skill.git ~/.dsh/skills/motion-video
+git clone https://github.com/IFIAnder/motion-video-skill.git ~/.dsh/skills/motion-video
 
 # 2. 体检：Chrome / ffmpeg / Node 是否就绪
 node ~/.dsh/skills/motion-video/scripts/render.mjs --check
@@ -60,7 +61,9 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 - `--motion-blur 180`：真实 180° 快门（以 4 倍帧率渲染后按曝光窗平均）——"看起来顺"与"看起来像录屏"的分界
 - `--guides`：关键帧叠加 100px 网格 / 80px 安全区 / 三分线 / 中心十字
 - `--sheet`：直接产出 3×3 接触表
-- `--alpha` / `--format webm|gif|webp` / `--scale 2` 超采样
+- `--alpha`：透明背景。**webp / apng / png 可靠**；webm 取决 ffmpeg 构建——本机实测 VP8/VP9 都会把 `yuva420p` 降级成 `yuv420p`，脚本会在编码后回读首帧校验，alpha 全 255 就当场报错并给出替代格式，不静默交付
+- `--format mp4|webm|gif|webp|apng|png`、`--scale 2` 超采样
+- 帧率优先级 `--fps` > `scene.fps` > 30（曾经写死 30，导致 `audit --fps` 把整条时间轴标错一倍）
 - 单实例锁：并发起多个 Chrome 会互相抢 CPU，**锁住比放开更快**
 
 ---

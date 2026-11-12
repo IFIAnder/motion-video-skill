@@ -55,10 +55,33 @@ if (!existsSync(opt.rig)) fail(`找不到 ${opt.rig}`)
 const TOL_PV = opt.tolPv ?? 6
 const TOL_POS = opt.tolPos ?? 6
 
+// --pose 只解析一次。坏 JSON 必须给人话 —— 直接抛 SyntaxError 会甩一段栈回溯，
+// 看起来像脚本崩了，实际只是引号在 PowerShell 里被吃了。
+let POSE = {}
+if (opt.pose) {
+  try {
+    POSE = JSON.parse(opt.pose)
+  } catch (e) {
+    fail(`--pose 不是合法 JSON：${e.message}\n`
+      + `  收到：${opt.pose}\n`
+      + `  正确形状：{"head":{"rot":0.2},"arm_l":{"sc":1.1}}\n`
+      + `  PowerShell 会吃掉内层双引号：用 --pose '{\\"head\\":{\\"rot\\":0.2}}'，或写成文件后从标准输入传`)
+  }
+  if (!POSE || typeof POSE !== 'object' || Array.isArray(POSE)) {
+    fail(`--pose 必须是对象 {骨名:{rot|sc|pos}}，收到的是${Array.isArray(POSE) ? '数组' : typeof POSE}`)
+  }
+}
+
 // ------------------------------------------------------------ 装载
 
 async function loadRig(file) {
-  const raw = JSON.parse(await readFile(file, 'utf8'))
+  let raw
+  try {
+    raw = JSON.parse(await readFile(file, 'utf8'))
+  } catch (e) {
+    if (e.code === 'ENOENT') fail(`找不到 ${file}`)
+    fail(`${file} 不是合法 JSON：${e.message}`)
+  }
   const bones = raw.bones || {}
   const parts = raw.parts || {}
   // 统一成节点表：name -> { parent, pos, rot, sc, pv, src, z, canvas, isPart }
@@ -134,7 +157,7 @@ const names = Object.keys(nodes)
 if (!names.length) fail('rig 里没有机节点（bones / parts 都是空的）')
 
 // 1. 父节点存在 / 无环
-const { pivot, bad } = solve(nodes, opt.pose ? JSON.parse(opt.pose) : {})
+const { pivot, bad } = solve(nodes, POSE)
 for (const b of bad) add('fail', 'graph', b, '检查 parent 字段拼写')
 for (const n of Object.values(nodes)) {
   if (n.parent && !nodes[n.parent]) {
@@ -224,7 +247,7 @@ for (const n of Object.values(nodes)) {
 
 // 6. 变换链守恒（--assert）：给 pose 时，父子枢轴距离必须不变
 if (opt.assert) {
-  const pose = opt.pose ? JSON.parse(opt.pose) : {}
+  const pose = POSE
   const rest = solve(nodes, {})
   const posed = solve(nodes, pose)
   for (const n of Object.values(nodes)) {

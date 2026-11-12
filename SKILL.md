@@ -152,7 +152,9 @@ description: '用代码做动画和视频：片头/动效/字幕动画/数据可
 
 ## 环境
 
-零 npm 依赖。需要 Chrome 或 Edge（本机已有）+ ffmpeg。
+零 npm 依赖。需要 Chrome 或 Edge（本机已有）+ ffmpeg + ffprobe。
+
+ffprobe 只有 `audit` 校验分辨率/时长时用。**缺了不会静默放行**：声明了 `--width/--height/--duration` 就 FAIL，没声明则 WARN 并打印"分辨率未知（未校验）"。
 
 ```bash
 node scripts/render.mjs --check      # 打印 chrome / ffmpeg / node / WebSocket 能力
@@ -212,7 +214,7 @@ node scripts/render.mjs --check      # 打印 chrome / ffmpeg / node / WebSocket
 | --- | --- | --- | --- | --- |
 | 片头 / 发布会 | 1920x1080 | 3–6s | 30 | mp4 |
 | 社交竖屏 | 1080x1920 | 5–15s | 30 | mp4 |
-| 网页 hero / banner | 1920x800 或 1440x600 | 2–4s，可循环 | 30 | webm（带 alpha 更佳） |
+| 网页 hero / banner | 1920x800 或 1440x600 | 2–4s，可循环 | 30 | webp / apng（要透明）；webm 需先验 alpha |
 | 数据动效 / 图表 | 1920x1080 | 3–8s | 30 | mp4 |
 | 循环动图 | 800x800 / 1080x1080 | 1–3s，必须能无缝循环 | 15–20 | gif / webp |
 | 讲解插片 | 1920x1080 | 每镜 2–5s，整片再拼 | 30 | mp4 |
@@ -407,7 +409,12 @@ node scripts/render.mjs --html scene.html --out out/final.mp4 --fps 60 --motion-
 # 2x 超采样（更锐，慢 3–4 倍）
 node scripts/render.mjs --html scene.html --out out/v.mp4 --scale 2
 
-# 透明背景（webm / png 序列）
+# 透明背景：webp / apng / png 可靠
+node scripts/render.mjs --html scene.html --out out/v.webp --format webp --alpha
+node scripts/render.mjs --html scene.html --out out/v.apng --format apng --alpha
+
+# webm 的 alpha 取决于 ffmpeg 构建。本机实测 VP8/VP9 都会降级成无 alpha，
+# 脚本会在编码后回读首帧校验 —— 没有透明像素就报错，并告诉你换哪个格式
 node scripts/render.mjs --html scene.html --out out/v.webm --format webm --alpha
 
 # 循环动图
@@ -419,7 +426,7 @@ node scripts/audit.mjs --video out/v.gif --loop           # 循环接缝检查
 node scripts/audit.mjs --video out/v.mp4 --json out/audit.json
 ```
 
-`render.mjs` 参数：`--html --out --fps --duration --width --height --scale --format --still --sheet --alpha --file --keep-frames --chrome --check --quiet`
+`render.mjs` 参数：`--html --out --fps --duration --width --height --scale --format(mp4|webm|gif|webp|apng|png) --still --sheet --alpha --file --keep-frames --chrome --check --quiet`
 `verify.mjs` 参数：`--html --select --props --from --to --steps --idempotent --all --json --file --chrome`
 `audit.mjs` 参数：`--video --fps --duration --width --height --grid --loop --pixel-thresh --json --quiet`
 

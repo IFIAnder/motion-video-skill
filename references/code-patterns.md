@@ -413,7 +413,7 @@ title.style.textShadow = `0 0 ${lerp(0, 60, k)}px rgba(96,150,255,.55)`;
 | `transform-origin` 默认 50% 50% | 进度条从中间长 | 设 `0 50%` |
 | 字体未加载就测量 | 文字位置跳 | `scene.ready` 里 `await document.fonts.ready` |
 | `getTotalLength()` 写在 seek 里 | 每帧强制回流，慢 | 载入时算一次 |
-| 半透明叠加没设背景 | mp4 里出现黑边 | `--alpha` + webm，或给底色 |
+| 半透明叠加没设背景 | mp4 里出现黑边 | `--alpha` + `--format webp`（或 apng / png 序列），或给底色。webm 的 alpha 要先验，很多 ffmpeg 构建会静默降级 |
 | 元素超出 1920x1080 | 被裁 | `#stage{overflow:hidden}`，留 80px 安全边 |
 | z-index 乱序 | 元素盖住标题 | 按层显式编号，别靠 DOM 顺序 |
 | `Date.now()` 做"欢迎动画" | 每次渲的不一样 | 换成 `t` |

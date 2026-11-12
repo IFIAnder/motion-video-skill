@@ -83,7 +83,10 @@ function runText(cmd, args) {
 }
 
 // ------------------------------------------------------------ 元数据
+// 读不到元数据不是"没问题"，是"没检查"。必须显式报出来，
+// 否则 --width/--height/--duration 会全部静默短路（曾经放行过 1920×1080 声明成 1280×720）。
 let meta = {}
+let metaError = ''
 {
   const r = await runText(ffprobe, ['-v', 'error', '-select_streams', 'v:0',
     '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration',
@@ -101,8 +104,11 @@ let meta = {}
       }
       const [num, den] = String(s.avg_frame_rate || s.r_frame_rate || '0/1').split('/').map(Number)
       meta.fps = den ? num / den : num
-    } catch { /* 忽略 */ }
+    } catch (e) { metaError = `ffprobe 输出无法解析：${e.message}` }
+  } else {
+    metaError = (r.err || '').split('\n').map((s) => s.trim()).filter(Boolean).slice(-1)[0] || `ffprobe 退出码 ${r.code}`
   }
+  if (!metaError && !meta.width) metaError = 'ffprobe 没返回视频流信息'
 }
 
 const fps = opt.fps || meta.fps || 30
@@ -178,6 +184,12 @@ const add = (level, kind, msg, hint = '') => findings.push({ level, kind, msg, h
 const pct = (v) => (v * 100).toFixed(2) + '%'
 
 // 1 元数据
+if (metaError) {
+  const declared = opt.width || opt.height || opt.duration
+  add(declared ? 'fail' : 'warn', 'meta',
+    `读不到视频元数据（${metaError}）${declared ? '，--width/--height/--duration 全部未校验' : ''}`,
+    `当前 ffprobe = ${ffprobe}。装 ffprobe 或设 FFPROBE_PATH 环境变量；声明了分辨率/时长就必须能校验，否则这两条声明等于没写`)
+}
 if (opt.width && meta.width && meta.width !== opt.width) add('fail', 'meta', `宽度 ${meta.width} ≠ 声明 ${opt.width}`, '检查 --width 是否被页面样式或 Emulation 覆盖')
 if (opt.height && meta.height && meta.height !== opt.height) add('fail', 'meta', `高度 ${meta.height} ≠ 声明 ${opt.height}`, '同上')
 if (opt.duration) {
@@ -220,13 +232,36 @@ if (maxChanged < 0.0003 && maxGray < 12) {
 }
 
 // 4 跳变
+// 阈值必须相对本片正常运动水平，但绝对下限不能按"整屏比例"定：
+// 一个 80×60 方块瞬移只占 320×180 网格的 0.5%，4px 进度线整条位移只占 0.6%，
+// 而 v1 的固定 5% 下限会把它们全部放行 —— 恰好是文档里自己说"最该保护"的细元素。
 {
   const base = Math.max(p75, 0.002)
-  const thr = Math.max(0.05, base * 5)
+  const thr = Math.max(0.002, base * 5)   // 绝对下限 0.2%（320×180 网格上约 115 像素）
   const jumps = steps.filter((s) => s.changed > thr && s.max > 45)
+
+  // 孤立硬切：不看面积，看"这一帧的剧变是不是孤立的"。
+  // 平滑运动每帧都在变，邻居的 max 一样高；硬切则是前后近乎静止、中间一帧剧变。
+  // 这条专治细元素：4px 线、6px 圆点在 320×180 网格上只落几个像素，
+  // 面积阈值永远够不着（等比下采样后百分比还是一样的），
+  // 但它们的灰度差是满格 255，且前后帧为 0 —— 这个特征和面积无关，所以抓得住。
+  const isolated = []
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i]
+    if (s.max < 120 || s.changed > thr) continue          // 已归主判据的不重复报
+    const prevMax = i > 0 ? steps[i - 1].max : 0
+    const nextMax = i < steps.length - 1 ? steps[i + 1].max : 0
+    if (Math.max(prevMax, nextMax) <= 40 && s.changed >= 0.00002) isolated.push(s)
+  }
+
+  const fmt = (j) => `${j.t}s ${pct(j.changed)} (max ${j.max})`
   if (jumps.length) {
-    add('warn', 'jump', `${jumps.length} 处硬跳变（变化像素 > ${pct(thr)}）：` + jumps.slice(0, 6).map((j) => `${j.t}s ${pct(j.changed)}`).join('、'),
+    add('warn', 'jump', `${jumps.length} 处大面积硬跳变（变化像素 > ${pct(thr)}）：` + jumps.slice(0, 6).map(fmt).join('、'),
       '① 设计内的场景切换：在分镜表里标注后忽略；② 缺缓动：位置从 A 直接跳到 B，用 ease 插值并确认中间帧存在。也可以用 --still 单独看跳变前后两帧')
+  }
+  if (isolated.length) {
+    add('warn', 'jump', `${isolated.length} 处孤立硬切（前后帧静止、单帧灰度差 ≥120）：` + isolated.slice(0, 6).map(fmt).join('、'),
+      '这一帧有东西整块跳了，前后都停着。面积大小不限：大色块是漏缓动，细线/小圆点/描边是布尔开关切换位置 —— 给小元素也写一段 ease，别用 if 直接改 style')
   }
 }
 
@@ -319,7 +354,8 @@ if (opt.json) {
 if (!opt.quiet) {
   const tag = { fail: '✖ FAIL', warn: '⚠ WARN', info: 'ℹ INFO' }
   console.log(`\n审计 ${path.basename(opt.video)}  →  ${verdict}\n`)
-  console.log(`  帧数 ${nFrames}  帧率 ${fps.toFixed(2)}  时长 ${duration.toFixed(2)}s  ${meta.width}x${meta.height}`)
+  const dims = meta.width && meta.height ? `${meta.width}x${meta.height}` : '分辨率未知（未校验）'
+  console.log(`  帧数 ${nFrames}  帧率 ${fps.toFixed(2)}  时长 ${duration.toFixed(2)}s  ${dims}`)
   console.log(`  变化像素  avg ${pct(avgChanged)}  p50 ${pct(p50)}  p95 ${pct(p95)}  峰值 ${pct(maxChanged)}   局部灰度差峰值 ${maxGray}`)
   console.log(`  节奏  [${curve}]   每格 ${bucket}s\n`)
   if (!findings.length) console.log('  没有发现问题。')

@@ -13,17 +13,20 @@
  * 保险写法：用单引号包整体，内部一律用「」，或者干脆裸写不放引号。
  *
  * 用法：
- *   node lint-skill.mjs                      # 扫 ~/.dsh/skills 下全部
+ *   node lint-skill.mjs                      # 当前目录/脚本所在 skill 优先，找不到才扫 ~/.dsh/skills
  *   node lint-skill.mjs <目录或SKILL.md路径>  # 扫指定
+ *   node lint-skill.mjs --all                # 强制扫 ~/.dsh/skills 下全部
  *   node lint-skill.mjs --all --json
  */
 
 import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 const argv = process.argv.slice(2)
 const json = argv.includes('--json')
+const all = argv.includes('--all')
 const targets = argv.filter((a) => !a.startsWith('--'))
 
 const DEFAULT_ROOT = path.join(os.homedir(), '.dsh', 'skills')
@@ -127,11 +130,32 @@ function lintFrontmatter(text) {
   return { errors, warnings, fields }
 }
 
-const roots = targets.length ? targets : [DEFAULT_ROOT]
+async function isSkillDir(dir) {
+  const s = await stat(path.join(dir, 'SKILL.md')).catch(() => null)
+  return !!s?.isFile()
+}
+
+// 无参时的默认范围：先看"我脚下"，再看"脚本自己在哪"，最后才回落到全局 skills 目录。
+// 曾经写死只扫 ~/.dsh/skills，在 skill 目录里照着 SKILL.md 的命令跑会报"没找到 SKILL.md" ——
+// 明明脚下就有一个，却因为 skill 没装进全局目录而扫空。
+let roots = targets
+if (!roots.length) {
+  if (all) {
+    roots = [DEFAULT_ROOT]
+  } else {
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    for (const c of [process.cwd(), path.dirname(here)]) {
+      if (await isSkillDir(c)) { roots = [c]; break }
+    }
+    if (!roots.length) roots = [DEFAULT_ROOT]
+  }
+}
+
 let files = []
 for (const r of roots) files.push(...await collect(path.resolve(r)))
 if (!files.length) {
   console.error(`✖ 在 ${roots.join(', ')} 下没找到 SKILL.md`)
+  console.error('  想扫全局 skills 目录：node lint-skill.mjs --all')
   process.exit(1)
 }
 

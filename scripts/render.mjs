@@ -37,7 +37,9 @@ import os from 'node:os'
 // ---------------------------------------------------------------- args
 
 const argv = process.argv.slice(2)
-const opt = { fps: 30, scale: 1, format: 'mp4', sheet: false, alpha: false, serve: true, guides: false, motionBlur: 0 }
+// fps 默认留空：让 scene.fps 有机会生效（曾经写死 30，导致场景里声明 fps:15 仍按 30 渲，
+// 随后 audit --fps 15 把整条时间轴标错一倍）。最终取值 = --fps || scene.fps || 30。
+const opt = { fps: undefined, scale: 1, format: 'mp4', sheet: false, alpha: false, serve: true, guides: false, motionBlur: 0 }
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]
   const val = () => {
@@ -75,17 +77,18 @@ function printHelp() {
 
   --html <file>       场景 HTML（必填，除非 --check）
   --out <path>        输出文件或目录，默认 out/render.<format>
-  --fps <n>           帧率，默认 30（也可由 scene.fps 提供）
+  --fps <n>           帧率；优先级 --fps > scene.fps > 30
   --duration <sec>    覆盖 scene.duration
   --width/--height    覆盖 scene.width/height，默认 1920x1080
   --scale <n>         设备像素比，默认 1（2 = 2x 超采样，更清晰更慢）
-  --format <fmt>      mp4 | webm | gif | webp | png，默认 mp4
+  --format <fmt>      mp4 | webm | gif | webp | apng | png，默认 mp4
   --still <t1,t2,..>  只渲染指定时刻（秒），输出 PNG，审图用，最快
   --guides            叠加构图辅助线（网格 / 80px 安全区 / 三分线 / 中心十字），只对 --still 生效
   --motion-blur <deg> 运动模糊（快门角度）。180 = 电影标准，360 = 满快门更糊，0 = 关闭（默认）
                       内部以 4 倍帧率渲染再按曝光窗平均，渲染时间 ×4
   --sheet             额外产出 3x3 接触表 PNG
-  --alpha             透明背景（配合 webm/png；mp4 不支持 alpha）
+  --alpha             透明背景。webp / apng / png 可靠；webm 取决于 ffmpeg 构建
+                      （本机实测 VP8/VP9 都会降级成无 alpha，脚本会在编码后回读校验并报错）
   --file              用 file:// 加载（默认起临时静态服务器，对 ES module 友好）
   --keep-frames       保留 PNG 帧序列
   --chrome <path>     指定浏览器可执行文件
@@ -190,6 +193,19 @@ function run(cmd, args, { silent = false } = {}) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 二进制 stdout 版本：alpha 校验要读原始像素，用字符串收集会把字节弄坏
+function runBin(cmd, args) {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, { windowsHide: true })
+    const bufs = []
+    let err = ''
+    p.stdout.on('data', (d) => bufs.push(d))
+    p.stderr.on('data', (d) => { err += d })
+    p.on('error', (e) => resolve({ code: -1, buf: Buffer.alloc(0), err: err + e.message }))
+    p.on('close', (code) => resolve({ code, buf: Buffer.concat(bufs), err }))
+  })
+}
 
 // ---------------------------------------------------------------- static server
 
@@ -400,6 +416,10 @@ try {
   const W = Math.round(opt.width || meta.width || 1920)
   const H = Math.round(opt.height || meta.height || 1080)
   const FPS = Number(opt.fps || meta.fps || 30)
+  if (!Number.isFinite(FPS) || FPS <= 0) {
+    die(`帧率无效：${opt.fps ?? meta.fps}（--fps 要给正数；scene.fps 也必须是正数）`)
+  }
+  if (!opt.fps && meta.fps) log(`  帧率取自 scene.fps = ${meta.fps}`)
   const DUR = Number(opt.duration || meta.duration)
   if (!DUR || DUR <= 0) die('拿不到时长：给 --duration 或让 scene.duration 有值')
 
@@ -508,15 +528,40 @@ try {
       if (r.code !== 0) throw new Error(`ffmpeg 失败：${r.err.split('\n').slice(-4).join(' ')}`)
       return target
     }
+
+    // --alpha 的验收：编码后回读首帧，alpha 必须真的有 0。
+    // 实测本机 ffmpeg（9.x gyan full build）把 yuva420p 静默降级成 yuv420p：
+    // VP8 和 VP9 出的 webm 看着正常，alpha 全是 255。这种静默降级必须当场抓住，
+    // 否则交付的是"自己看着透明、叠到背景上才发现是个不透明色块"的文件。
+    const assertAlpha = async (file, name) => {
+      const r = await runBin(ffmpeg, ['-y', '-v', 'error', '-i', file,
+        '-frames:v', '1', '-pix_fmt', 'rgba', '-f', 'rawvideo', '-'])
+      if (r.code !== 0 || r.buf.length < 4) return
+      let zeros = 0
+      for (let i = 3; i < r.buf.length; i += 4) if (r.buf[i] === 0) zeros++
+      if (zeros === 0) {
+        die(
+          `--alpha 没有生效：${name} 的 alpha 全是 255（${r.buf.length / 4} 个像素里没有一个透明）。\n` +
+          `  不是参数写错，是当前 ffmpeg 不给 ${name} 写 alpha 通道。\n` +
+          `  实测本机 ${ffmpeg} 对 VP8/VP9 的 yuva420p 一律降级成 yuv420p。\n` +
+          `  可用替代：--format webp（动画 WebP，带 alpha）｜--format apng（带 alpha）｜--format png（透明序列）\n` +
+          `  坚持要 webm 就得换一个带 libvpx alpha 支持的 ffmpeg 构建。`
+        )
+      }
+      log(`  alpha 校验通过：${name} 含 ${zeros} 个透明像素`)
+    }
+
     // 有模糊时所有格式都先统一降帧（blurVf 已包含 select 与 setpts）
     if (fmt === 'mp4') {
+      if (opt.alpha) log('  提示：mp4/H.264 不支持 alpha，--alpha 无效（要透明用 webp / apng / png）')
       await encode([...seqIn, ...(blurVf ? ['-vf', blurVf, '-r', String(FPS)] : []),
         '-c:v', 'libx264', '-preset', 'slow', '-crf', '17',
         '-pix_fmt', 'yuv420p', '-movflags', '+faststart'], outPath)
     } else if (fmt === 'webm') {
       await encode([...seqIn, ...(blurVf ? ['-vf', blurVf, '-r', String(FPS)] : []),
         '-c:v', 'libvpx-vp9', '-crf', '28', '-b:v', '0',
-        ...(opt.alpha ? ['-pix_fmt', 'yuva420p'] : []), '-row-mt', '1'], outPath)
+        ...(opt.alpha ? ['-pix_fmt', 'yuva420p', '-auto-alt-ref', '0'] : []), '-row-mt', '1'], outPath)
+      if (opt.alpha) await assertAlpha(outPath, 'webm')
     } else if (fmt === 'gif') {
       const pal = path.join(outDir, '.palette.png')
       const gf = `fps=${Math.min(FPS, 25)},scale=${Math.min(W, 960)}:-1:flags=lanczos`
@@ -526,8 +571,16 @@ try {
         `${blurVf ? blurVf + ',' : ''}${gf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=3`], outPath)
       try { await rm(pal, { force: true }) } catch {}
     } else if (fmt === 'webp') {
-      await encode([...seqIn, ...(blurVf ? ['-vf', blurVf] : []),
-        '-vf', `fps=${FPS}`, '-loop', '0', '-c:v', 'libwebp_anim', '-quality', '82'], outPath)
+      // 原写法带了第二个 -vf，会把 blurVf 整个覆盖掉（开了运动模糊却出无模糊的 webp）
+      await encode([...seqIn,
+        '-vf', `${blurVf ? blurVf + ',' : ''}fps=${FPS}`,
+        '-loop', '0', '-c:v', 'libwebp_anim',
+        ...(opt.alpha ? ['-pix_fmt', 'rgba'] : []), '-quality', '82'], outPath)
+      if (opt.alpha) await assertAlpha(outPath, 'webp')
+    } else if (fmt === 'apng') {
+      await encode([...seqIn, ...(blurVf ? ['-vf', blurVf, '-r', String(FPS)] : []),
+        '-c:v', 'apng', '-pix_fmt', 'rgba', '-plays', '0'], outPath)
+      if (opt.alpha) await assertAlpha(outPath, 'apng')
     } else if (fmt === 'png') {
       // 只出序列 = 已产出，原样保留（此时序列是 RENDER_FPS，含子帧）
     } else {

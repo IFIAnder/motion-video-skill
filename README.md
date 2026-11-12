@@ -1,11 +1,12 @@
 # motion-video · 用代码做能验收的动画
 
-> 一个给**弱模型**（Flash / mini / turbo 级）用的动效与视频生产 skill。
+> 一个给**弱模型**（Flash / mini / turbo 级）用的动效、视频与配乐生产 skill。
 > 目标不是"让模型写得更漂亮"，而是**把动画变成可被机器判定的工程物**——
 > 让"我以为我写了动效"这件事，在交付前被机器拆穿。
+> 声音同理：**先列事件表，再让合成器把波形算出来**，而不是去翻素材库。
 
 零 npm 依赖。只需要 Chrome/Edge + ffmpeg + ffprobe + Node。
-（ffprobe 只在 `audit` 校验分辨率/时长时用。缺了不会静默放行——声明了 `--width/--height/--duration` 就直接 FAIL，没声明则 WARN。）
+（ffprobe 只在 `audit` / `audiocheck` 校验分辨率、时长、采样率时用。缺了不会静默放行——声明了 `--width/--height/--duration` 就直接 FAIL，没声明则 WARN。算音频**不需要浏览器**，`audio.mjs` 是纯 Node。）
 
 ---
 
@@ -45,7 +46,7 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 
 ---
 
-## 六个脚本
+## 十个脚本
 
 | 脚本 | 干什么 | 为什么需要它 |
 | --- | --- | --- |
@@ -55,6 +56,10 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 | `ease.mjs` | 贝塞尔 / 弹簧 / 错开步长 / 对比度 / CSS `linear()` | **数值不许心算**，让工具算 |
 | `rigcheck.mjs` | 骨骼几何断言 + 与参考 rig 逐部件对比 | 抓"头飘在身体旁边"这类眼睛看不出的错 |
 | `lint-skill.mjs` | 校验 SKILL.md frontmatter | 防"引号写错 → 整个 skill 加载不了" |
+| `synth.mjs` | 离线确定性合成器：23 个 voice、SVF 滤波、Freeverb、四条总线 | 声音**算得出来**才谈得上可重现、可对拍、可微调 |
+| `audio.mjs` | 把音频场景（一份写谱文件）算成 WAV，300ms / 8 秒 | 和 `seek(t)` 同构：你只写"什么时刻发生什么" |
+| `audiocheck.mjs` | 削波 / 静音段 / 动态范围 / 首尾爆音 / 音画时长 | 音频没法快速听完，这几件事只能靠机器 |
+| `mux.mjs` | 音视频合流，**合之前核对、合之后重新 probe** | 合流是最容易"看着成功其实坏了"的一步 |
 
 ### 附加能力
 
@@ -68,7 +73,7 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 
 ---
 
-## 六份文档（按需读，别一次全读）
+## 九份文档（按需读，别一次全读）
 
 | 文件 | 内容 |
 | --- | --- |
@@ -78,8 +83,9 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 | `references/asset-recipes.md` | **20 类零依赖视觉片段**：光晕/扫光/颗粒/玻璃/霓虹/网格/插画/粒子/线框球/图表/图标集/散景/伪 3D |
 | `references/rig-characters.md` | 部件骨骼：`rig.json` 结构、`solve/draw`、12 条动画原则怎么落到字段、**为什么不许重估现成 rig** |
 | `references/cinema-grade.md` | 运动模糊、抗色带编码参数、暗角、HUD 系统、甩镜、帧率决策、长片组织、多 tab 提速 |
+| `references/audio-recipes.md` | **六个可抄的音频配方**：片头 / UI 演示 / 数据动效 / 循环 / 转场 / 氛围；四条总线的音量域；和弦工具；整条流水线 |
 | `references/review-checklist.md` | 人眼抽检清单 + 交付前逐条过 |
-| `references/failure-modes.md` | 按 audit/verify 报错对号入座的修法 |
+| `references/failure-modes.md` | 按 audit / audiocheck / verify 报错对号入座的修法 + 已知边界 |
 | `references/delta-vs-opus.md` | 与强模型的差距拆解：哪些补得上、哪些补不上 |
 
 ---
@@ -89,6 +95,9 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 ```
 ease（算参数） → verify（查数字） → render（出图） → audit（查像素） → 人眼
    0.5s            秒级              8s/3s片          1s/片
+
+audio（算波形） → audiocheck（查电平/时长） → mux（合流） → audiocheck 再验一次
+   0.3s/8s片          1s/8s片                       0.2s
 ```
 
 **越靠前的错越便宜。** 用便宜手段堵住能堵的问题：
@@ -97,6 +106,8 @@ ease（算参数） → verify（查数字） → render（出图） → audit�
 - `verify` 抓"中间态丢了"：`#b.sx — 0–2s 数值完全不变，之后又继续变化`
 - `audit` 抓"整帧在停"：`warn [static] 中段静止 1.10–2.57s`
 - `rigcheck` 抓"骨骼错位"：`torso.pv 偏 131px`、`head.pos 偏 65.9px`
+- `audiocheck` 抓"整片没声音 / 削波 45% / 动态范围 0 dB / 音画差 320ms"
+- `mux` 抓"合流时被 -shortest 截掉尾音"：它在合之后重新 probe，不信返回码
 
 ---
 

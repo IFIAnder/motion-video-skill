@@ -1,6 +1,6 @@
 ---
 name: motion-video
-description: '用代码做动画和视频：片头/动效/字幕动画/数据可视化动效/UI 演示/讲解片段/循环动图，输出 mp4/webm/gif/webp，并有机器验收回环保证「画面真的在动、没有丢中间态」。用户说「做个动画/动效/片头/开场/蒙太奇/动图/懒加载 banner/视频片段/演示动画/用代码生成视频/HTML 转视频/remotion 风格」，或要求把一段内容做成可以播放的片子时使用。不用于文生视频（云视频模型）、真人素材剪辑、配音配乐。'
+description: '用代码做动画、视频和配乐：片头/动效/字幕动画/数据可视化动效/UI 演示/讲解片段/循环动图，输出 mp4/webm/gif/webp；有合成器可以直接算配乐与音效（鼓组/合成器/转场音效），不需要素材库。机器验收回环保证「画面真的在动、没有丢中间态」以及「声音响在该响的地方、没有削波和空白段」。用户说「做个动画/动效/片头/开场/蒙太奇/动图/懒加载 banner/视频片段/演示动画/用代码生成视频/HTML 转视频/remotion 风格」，或要求「配乐/音效/加个声音/做个 BGM/给视频配音/片头音乐」，或要求把一段内容做成可以播放、能听的片子时使用。不用于文生视频（云视频模型）、真人素材剪辑、真人配音与歌曲人声。'
 ---
 
 # motion-video · 用代码做能验收的动画
@@ -186,6 +186,7 @@ node scripts/render.mjs --check      # 打印 chrome / ffmpeg / node / WebSocket
 | [references/asset-recipes.md](references/asset-recipes.md) | **画面缺东西时第一时间翻**：光晕、扫光、颗粒、玻璃、霓虹、网格、插画、粒子、线框球、图表、图标集、散景、伪 3D |
 | [references/rig-characters.md](references/rig-characters.md) | 画面里有角色要动：部件 + 父子变换链 + pose 表 + 12 条原则怎么落到字段上 |
 | [references/cinema-grade.md](references/cinema-grade.md) | 定稿前：运动模糊、编码参数（抗色带）、暗角、HUD 系统、甩镜、帧率选择、长片组织、并行提速 |
+| [references/audio-recipes.md](references/audio-recipes.md) | **要声音时读这个**：先列时间轴再选音色、四条总线的音量域、六个可抄的配方（片头/UI/数据/循环/转场/氛围）、和弦工具、整条流水线 |
 | [references/review-checklist.md](references/review-checklist.md) | STEP 5 人眼抽检 + 交付前逐条过 |
 | [references/failure-modes.md](references/failure-modes.md) | audit/verify 报错时对号入座 |
 | [references/delta-vs-opus.md](references/delta-vs-opus.md) | 想知道"这套东西到底能补到哪一步"、要判断该不该换模型时 |
@@ -340,6 +341,35 @@ node scripts/audit.mjs --video out/v.mp4 --fps 30 --duration 3 --width 1920 --he
 
 清单： [references/review-checklist.md](references/review-checklist.md)
 
+### STEP 5.5 · 声音（片子要能听的时候）
+
+音频不用素材，**用代码算**。理由是可控性：一段 4.2s 落下的"叮"，算出来的能挪到 4.35s 再算一遍；
+素材只能导进编辑器手动拖，而且永远差几十毫秒——人对 30ms 的音画不同步就能察觉。
+
+先看 STEP 4 的 audit 结论，把"画面在什么时候发生什么"抄成一张事件表，再写谱：
+
+```bash
+node scripts/audio.mjs --scene audio-scene.mjs --out out/audio.wav --duration 3
+node scripts/audiocheck.mjs --wav out/audio.wav --duration 3
+```
+
+**表里没写声音的时刻就不要有声音。** `audiocheck` 会把"从头到尾一个响度"报成
+`[flat] 动态范围 < 3 dB` —— 那不是"氛围铺底"，那是没有编曲。
+
+配方（片头 / UI 演示 / 数据动效 / 循环 / 转场 / 氛围，全部可直接抄）：
+[references/audio-recipes.md](references/audio-recipes.md)
+
+合流用 `mux.mjs`，不要手写 ffmpeg 命令——它在合流**之前**核对音画时长，
+在合流**之后**重新 probe 两条流：
+
+```bash
+node scripts/mux.mjs --video out/v.mp4 --audio out/audio.wav --out out/final.mp4
+node scripts/audiocheck.mjs --wav out/final.mp4 --video out/v.mp4   # 对成品再验一次
+```
+
+判据和 audit 一样：`FAIL` 不许交付（削波、整段没声音、音画差超过一帧、中段静音）；
+每条 `WARN` 要么改，要么在交付说明里写"设计内的，因为…"。
+
 ### STEP 6 · 交付
 
 ```bash
@@ -348,8 +378,8 @@ node scripts/render.mjs --html scene.html --out out/v.webm --format webm
 node scripts/render.mjs --html scene.html --out out/v.gif --format gif --fps 15
 ```
 
-交付时给：成片路径、接触表、audit 的 verdict 那几行、storyboard.md。
-如果 audit 有 WARN 但你判断是设计内的，明说是哪一条、为什么。
+交付时给：成片路径（有声音就是合流后的那个）、接触表、audit 与 audiocheck 的 verdict 那几行、storyboard.md。
+如果 audit/audiocheck 有 WARN 但你判断是设计内的，明说是哪一条、为什么。
 
 **定稿版必须开运动模糊重渲一次。**
 
@@ -390,6 +420,19 @@ node scripts/lint-skill.mjs
 node scripts/verify.mjs --html scene.html --select "#bar b" --props transform,opacity --steps 31
 node scripts/verify.mjs --html scene.html --select ".item" --idempotent
 node scripts/verify.mjs --html scene.html --all --json
+
+# 音频：算出来，不用素材（composer）
+node scripts/audio.mjs --check
+node scripts/audio.mjs --demo --duration 8 --out out/demo.wav
+node scripts/audio.mjs --scene audio-scene.mjs --out out/audio.wav --duration 8
+node scripts/audio.mjs --scene s.mjs --out a.wav --seed 7 --peak 0.85 --mono
+
+# 音频验收（削波 / 静音段 / 一个音量到底 / 首尾爆音 / 音画时长）
+node scripts/audiocheck.mjs --wav out/audio.wav --duration 8
+node scripts/audiocheck.mjs --wav out/audio.wav --video out/v.mp4
+
+# 合流（合前核对时长、合后重新 probe 两条流）
+node scripts/mux.mjs --video out/v.mp4 --audio out/audio.wav --out out/final.mp4
 
 # 关键帧（审图用，最快）
 node scripts/render.mjs --html scene.html --still 0,0.5,1.5,2.9 --out out/stills
@@ -451,6 +494,14 @@ ffmpeg -y -i s1.mp4 -i s2.mp4 -filter_complex \
 
 拼完对整片再跑一次 `audit`（能抓到镜头之间的黑帧和时长错位）。
 
+有声音时，音频也按镜头拼，再对整片合流——别把每段各自合流再拼，那样 AAC 会被反复解编码：
+
+```bash
+printf "file 'a1.wav'\nfile 'a2.wav'\n" > alist.txt
+ffmpeg -y -f concat -safe 0 -i alist.txt -c copy out/full.wav
+node scripts/mux.mjs --video out/full.mp4 --audio out/full.wav --out out/final.mp4
+```
+
 ---
 
 ## 什么时候不该用这个 skill
@@ -459,6 +510,6 @@ ffmpeg -y -i s1.mp4 -i s2.mp4 -filter_complex \
 
 - **要 AI 生成的实拍感画面**（人物、风景、真实运镜）→ 用文生视频模型/相应插件，这不是代码能画的
 - **要剪真人素材、录屏、采访** → ffmpeg 剪辑工作流，不需要写动画
-- **要配乐、配音、音效** → 另找音频工具；本 skill 只出画面
+- **要真人配音、歌曲人声、版权曲库** → 另找音频工具。本 skill 算的是合成器音色（鼓组、合成器、音效），没有人声，也不碰版权素材；但"片头配乐 + 音效"这件事它自己能做完
 - **要 3D、物理拟真** → 用 Blender/引擎；HTML/Canvas 做不了可信的物理
 - **要一次成片、不容返工、审美即产品** → 这是本 skill 能靠近但补不平的部分，见 delta-vs-opus.md

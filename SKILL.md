@@ -451,6 +451,9 @@ node scripts/mux.mjs --video out/v.mp4 --audio out/audio.wav --out out/final.mp4
 # 关键帧（审图用，最快）
 node scripts/render.mjs --html scene.html --still 0,0.5,1.5,2.9 --out out/stills
 
+# GPU：默认 auto（重特效场景快约 2 倍）；要逐像素可复现时用 swift
+node scripts/render.mjs --html scene.html --out out/v.mp4 --gl swift
+
 # 关键帧 + 构图辅助线（100px 网格 / 80px 安全区 / 三分线 / 中心十字）
 node scripts/render.mjs --html scene.html --still 1.6 --guides --out out/guides
 

@@ -62,6 +62,7 @@ for (let i = 0; i < argv.length; i++) {
     case '--allow-concurrent': opt.allowConcurrent = true; break
     case '--sheet': opt.sheet = true; break
     case '--alpha': opt.alpha = true; break
+    case '--gl': opt.gl = val(); break
     case '--file': opt.serve = false; break
     case '--chrome': opt.chrome = val(); break
     case '--keep-frames': opt.keepFrames = true; break
@@ -89,6 +90,9 @@ function printHelp() {
   --sheet             额外产出 3x3 接触表 PNG
   --alpha             透明背景。webp / apng / png 可靠；webm 取决于 ffmpeg 构建
                       （本机实测 VP8/VP9 都会降级成无 alpha，脚本会在编码后回读校验并报错）
+  --gl <mode>         auto（默认，走 GPU）| swift（软件渲染，逐像素可复现）| d3d11 | gl
+                      重特效场景（filter/blur/mix-blend）GPU 约快 2 倍；
+                      普通 DOM 场景两者一样快，因为瓶颈在截图不在光栅化。见源码注释
   --file              用 file:// 加载（默认起临时静态服务器，对 ES module 友好）
   --keep-frames       保留 PNG 帧序列
   --chrome <path>     指定浏览器可执行文件
@@ -284,7 +288,7 @@ class CDP {
   close() { try { this.ws.close() } catch {} }
 }
 
-async function launchChrome(chromePath) {
+async function launchOnce(chromePath, glArgs) {
   // 顺手清掉上次异常退出留下的 profile（后台删除没删完的），避免 %TEMP% 涨大
   const tmpRoot = os.tmpdir()
   readdir(tmpRoot).then((names) => {
@@ -312,8 +316,7 @@ async function launchChrome(chromePath) {
     '--force-color-profile=srgb',
     '--font-render-hinting=none',
     '--allow-file-access-from-files',
-    '--use-angle=swiftshader',      // 让 canvas / WebGL 在无 GPU 环境也能确定性出图
-    '--enable-unsafe-swiftshader',
+    ...glArgs,
     '--mute-audio',
     'about:blank',
   ]
@@ -366,6 +369,50 @@ async function launchChrome(chromePath) {
       rm(userDir, { recursive: true, force: true }).catch(() => {})
     },
   }
+}
+
+// ---------------------------------------------------------------- GL 后端
+//
+// 原来这里写死 --use-angle=swiftshader，理由是"无 GPU 环境也能确定性出图"。
+// 实测之后这个决定要分开看（1920x1080，60 帧）：
+//
+//   24 层 filter:blur() 的重特效场景   swiftshader 30.0s  |  d3d11 15.5s   → GPU 快一倍
+//   普通 DOM 场景（demo-scene）        swiftshader 15.6s  |  d3d11 15.5s   → 一样快
+//
+// 为什么普通场景一样快：90 帧的总时间里 13.5s 花在"逐帧 CDP 截图"，只有 2.1s 是 ffmpeg 编码。
+// 截图走的是合成器 → 读回 → PNG 编码，全在 CPU 上，GPU 帮不上忙。
+// 而 filter / blur / mix-blend-mode 这类效果每帧都要重新光栅化，那里才是 GPU 的主场。
+//
+// 代价是像素不完全相同：同一场景 swiftshader 与 d3d11 的 md5 就不一样（抗锯齿与混合的细微差别）。
+// 所以默认 auto（能用 GPU 就用，快），需要"重渲染后逐像素一致"时显式 --gl swift。
+const GL_MODES = {
+  auto: [],                                                          // Chrome 自己选，通常走 GPU
+  swift: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],  // 软件渲染，可复现
+  swiftshader: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
+  d3d11: ['--use-angle=d3d11', '--enable-gpu'],                       // Windows 上的 D3D11
+  gl: ['--use-gl=desktop', '--enable-gpu'],
+}
+
+async function launchChrome(chromePath) {
+  const want = String(opt.gl || 'auto').toLowerCase()
+  if (!GL_MODES[want]) die(`--gl 只支持 ${Object.keys(GL_MODES).join(' | ')}（当前 ${want}）`)
+  // auto 在某些远程桌面 / 无显卡环境起不来，回落 swift 而不是直接失败
+  const attempts = want === 'auto' ? ['auto', 'swift'] : [want]
+  let lastErr
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      const b = await launchOnce(chromePath, GL_MODES[attempts[i]])
+      opt.glUsed = attempts[i]
+      return b
+    } catch (e) {
+      lastErr = e
+      if (i < attempts.length - 1) {
+        log(`  --gl ${attempts[i]} 起不来（${String(e.message).split('\n')[0]}），回落到 ${attempts[i + 1]}`)
+        await sleep(300)
+      }
+    }
+  }
+  throw lastErr
 }
 
 // ---------------------------------------------------------------- main
@@ -609,7 +656,7 @@ try {
     const sz = existsSync(outPath) ? (await stat(outPath)).size : 0
     console.log(JSON.stringify({
       ok: true, video: outPath, sheet: sheetPath, frames: total, fps: FPS,
-      renderFps: RENDER_FPS, motionBlur: opt.motionBlur || 0, blurMix: mixFrames,
+      renderFps: RENDER_FPS, motionBlur: opt.motionBlur || 0, blurMix: mixFrames, gl: opt.glUsed || 'auto',
       duration: DUR, size: `${W}x${H}`, bytes: sz,
       next: `node audit.mjs --video "${outPath}" --fps ${FPS} --duration ${DUR} --width ${W} --height ${H}`,
     }, null, 2))

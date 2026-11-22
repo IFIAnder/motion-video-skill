@@ -202,6 +202,28 @@ let next = 0, write = 0;
 本 skill 的 `render.mjs` 走的是落盘 PNG 路线（简单、可断点、可用 `--keep-frames` 复盘），
 短片够用；要拍长片时按上面两条改。
 
+### ③ GPU 渲染：分场景，别一概而论
+
+`render.mjs --gl` 控制 Chrome 的图形后端。默认 `auto`（有显卡就走 GPU），`--gl swift` 强制软件渲染。
+
+实测（1920x1080，60 帧，同一台机器）：
+
+| 场景 | `--gl swift` | `--gl auto` | 结论 |
+| --- | --- | --- | --- |
+| 24 层 `filter: blur()` + `mix-blend-mode` | **26.4s** | **15.4s** | GPU 快 1.7 倍 |
+| 普通 DOM（`examples/demo-scene.html`） | 15.4s | 15.4s | 一样快 |
+
+**为什么普通场景没差别**：90 帧的总时间里 13.5s 花在逐帧 CDP 截图（合成 → 读回 → PNG 编码），
+只有 2.1s 是 ffmpeg 编码。这三步全在 CPU 上，GPU 帮不上忙。
+而 `filter` / `blur` / `backdrop-filter` / `mix-blend-mode` 每帧都要重新光栅化 —— 那里才是 GPU 的主场。
+
+**代价**：两种后端像素不完全相同（同一场景 md5 就差几个字节，抗锯齿与混合的细微差别）。
+`audit` 的判定不受影响（实测 PASS/PASS，变化峰值差 0.03%），但**需要"重渲染后逐像素一致"时用 `--gl swift`**：
+
+- 迭代阶段 → 默认 `auto`，快
+- 要对比"改完之后画面有没有意外变化" → `--gl swift`，两次渲染才可比
+- 交付版 → 两种都行；但如果你的机器没有独立显卡，`auto` 会自动回落到 `swift`，不会失败
+
 ---
 
 ## 10. 交付前最后一遍

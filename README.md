@@ -69,6 +69,8 @@ node scripts/audit.mjs --video /tmp/demo.mp4 --fps 30 --duration 3 --width 1920 
 - `--alpha`：透明背景。**webp / apng / png 可靠**；webm 取决 ffmpeg 构建——本机实测 VP8/VP9 都会把 `yuva420p` 降级成 `yuv420p`，脚本会在编码后回读首帧校验，alpha 全 255 就当场报错并给出替代格式，不静默交付
 - `--format mp4|webm|gif|webp|apng|png`、`--scale 2` 超采样
 - 帧率优先级 `--fps` > `scene.fps` > 30（曾经写死 30，导致 `audit --fps` 把整条时间轴标错一倍）
+- `--gl auto|swift`：默认 `auto` 走 GPU。实测 24 层 `filter:blur()` 的场景 GPU 快 1.7 倍（26.4s → 15.4s），
+  普通 DOM 场景两者一样快（瓶颈在逐帧截图不在光栅化）；要"重渲染后逐像素一致"时用 `--gl swift`
 - 单实例锁：并发起多个 Chrome 会互相抢 CPU，**锁住比放开更快**
 
 ---

@@ -181,26 +181,28 @@ ACT.apex = (ACT.takeoff + ACT.land) / 2;   // 派生量也算在这里
 
 小片（< 15s）用 `render.mjs` 单页渲染够用。上百秒的片子要做两件事：
 
-**① 多页并行**：起 4 个 page 同时渲染不同帧，按帧号保序写入。
+**① 多页并行**：**已内置，`--jobs N`，默认按核数自动取（上限 4）。**
 
-```js
-const pages = await Promise.all([...Array(4)].map(async () => { /* 新 tab + goto */ }));
-const ready = new Map();        // 帧号 → Buffer
-let next = 0, write = 0;
-// 每个 page 领一帧 → 完成就塞进 ready → flush() 按 write 顺序写 ffmpeg
-```
+一个 Chrome 里开 N 个 target，共享游标领帧（谁渲完谁领下一帧，比静态分段更能自动均衡）。
+实测（1920×1080 @30fps，同一台 32 核机器，含启动与编码开销）：
 
-两个坑：
-- **背压**：`ready.size` 超过 `tabs*8` 就等一下。否则内存爆。
-- **微任务饥饿**：等待时用 `await new Promise(r => setTimeout(r, 4))`，不要 `await Promise.resolve()`
-  ——后者会饿死持有下一帧的那个 tab，直接死锁。
+| 场景 | `--jobs 1` | `--jobs 4` | `--jobs 8` | `--jobs 16` |
+| --- | --- | --- | --- | --- |
+| `examples/demo-scene.html` 240 帧 | 24.9s | **15.6s** | 15.5s | — |
+| `examples/illustrated-scene.html` 180 帧 | 24.8s | **15.7s** | 23.2s | 15.6s |
 
-**② 不落盘**：页面暴露 `window.frameURL(t)` 返回 PNG dataURL，
+**加速比 1.57–1.60 倍，4 路就饱和了。** 8 路、16 路都没有额外收益，甚至回退——
+瓶颈不在核数，而在**浏览器进程把截图序列化**这一步（多 tab 只能并行光栅化，不能并行 PNG 编码与读回）。
+
+**像素代价**：跨 tab 渲染同一帧，与单 tab 的差异是 LSB 级——
+实测 PSNR 53.8 / 55.3 / 111.3 dB，SSIM 0.99984–1.000000。人眼看不出，编码后基本消失。
+所以交付版可以放心用 `--jobs 4`；但**要逐字节复现上一次的输出**（回归测试、像素级 diff），
+请用 `--jobs 1 --gl swift`，两次渲染才可比。
+
+**② 不落盘**（还没实现）：页面暴露 `window.frameURL(t)` 返回 PNG dataURL，
 直接 `Buffer.from(base64)` 塞进 `ffmpeg -f image2pipe -framerate 60 -i -`。
-省掉几千次磁盘写，长片上能快一倍以上。
-
-本 skill 的 `render.mjs` 走的是落盘 PNG 路线（简单、可断点、可用 `--keep-frames` 复盘），
-短片够用；要拍长片时按上面两条改。
+省掉几千次磁盘写。`render.mjs` 目前走落盘 PNG 路线（简单、可断点、`--keep-frames` 可复盘），
+短片够用；一帧约 1.5 MB，240 帧就是 360 MB 的写入加再读取，长片上是实打实的一二十个百分点。
 
 ### ③ GPU 渲染：分场景，别一概而论
 

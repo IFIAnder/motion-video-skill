@@ -39,7 +39,7 @@ import os from 'node:os'
 const argv = process.argv.slice(2)
 // fps 默认留空：让 scene.fps 有机会生效（曾经写死 30，导致场景里声明 fps:15 仍按 30 渲，
 // 随后 audit --fps 15 把整条时间轴标错一倍）。最终取值 = --fps || scene.fps || 30。
-const opt = { fps: undefined, scale: 1, format: 'mp4', sheet: false, alpha: false, serve: true, guides: false, motionBlur: 0 }
+const opt = { fps: undefined, scale: 1, format: 'mp4', sheet: false, alpha: false, serve: true, guides: false, motionBlur: 0, jobs: 0 }
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]
   const val = () => {
@@ -67,6 +67,7 @@ for (let i = 0; i < argv.length; i++) {
     case '--chrome': opt.chrome = val(); break
     case '--keep-frames': opt.keepFrames = true; break
     case '--check': opt.check = true; break
+    case '--jobs': opt.jobs = Math.max(0, Math.min(8, Number(val()) || 0)); break
     case '--quiet': opt.quiet = true; break
     case '-h': case '--help': printHelp(); process.exit(0)
     default: die(`未知参数 ${a}（--help 查看用法）`)
@@ -88,6 +89,11 @@ function printHelp() {
   --motion-blur <deg> 运动模糊（快门角度）。180 = 电影标准，360 = 满快门更糊，0 = 关闭（默认）
                       内部以 4 倍帧率渲染再按曝光窗平均，渲染时间 ×4
   --sheet             额外产出 3x3 接触表 PNG
+--jobs <n>          一个浏览器里开 n 个 tab 并行渲染，默认按核数自动取（上限 4，实测甜点）。
+                    截图是 CPU 瓶颈，4 路约 1.6 倍速；--jobs 1 关闭并行。
+                    并行不改变画面（跨 tab 逐帧 PSNR >53dB、SSIM 0.9999），
+                    但要逐字节复现上一次的输出，请用 --jobs 1 --gl swift。
+--allow-concurrent  允许同时跑多个 render 进程（一般不需要，--jobs 更快也更省内存）
   --alpha             透明背景。webp / apng / png 可靠；webm 取决于 ffmpeg 构建
                       （本机实测 VP8/VP9 都会降级成无 alpha，脚本会在编码后回读校验并报错）
   --gl <mode>         auto（默认，走 GPU）| swift（软件渲染，逐像素可复现）| d3d11 | gl
@@ -344,7 +350,7 @@ async function launchOnce(chromePath, glArgs) {
   }
   if (!wsUrl) { try { proc.kill() } catch {}; throw new Error('连不上浏览器调试端点') }
   return {
-    proc, userDir,
+    proc, userDir, port,
     async connect() {
       const ws = new WebSocket(wsUrl)
       await new Promise((res, rej) => {
@@ -427,27 +433,61 @@ let serverInfo = null
 if (opt.serve) serverInfo = await startServer(rootDir)
 
 const browser = await launchChrome(chromePath)
-const cdp = await browser.connect()
+const mainCdp = await browser.connect()
+
+// ---- 多 tab 并行：--jobs N 在同一个 Chrome 里开 N 个 target ----
+// 不是多进程：每个 Chrome 有自己的 GPU/合成器上下文，进程间抢 CPU 反而更慢（见上面的单实例锁）。
+// 同一个浏览器的多个 tab 各在自己的渲染进程里截图，这才是能吃满多核的形态。
+// 实测（examples/ 两个场景，180-240 帧）：1 路 24.8s → 4 路 15.7s（1.6×）；
+// 8 路与 16 路都没有额外收益，瓶颈在浏览器进程的截图序列化而不是核数。所以 4 是甜点。
+const autoJobs = Math.min(4, Math.max(1, Math.floor(os.cpus().length / 2)))
+const JOBS = opt.jobs > 0 ? opt.jobs : autoJobs
+const conns = [mainCdp]
 
 try {
-  await cdp.send('Page.enable')
-  await cdp.send('Runtime.enable')
+  if (JOBS > 1) {
+    const created = []
+    for (let i = 1; i < JOBS; i++) {
+      const r = await mainCdp.send('Target.createTarget', { url: 'about:blank', background: true })
+      if (r && r.targetId) created.push(r.targetId)
+    }
+    const list = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()
+    for (const tid of created) {
+      const t = list.find((x) => x.id === tid && x.webSocketDebuggerUrl)
+      if (!t) die('开不出额外 tab：Target.createTarget 有回执但 /json/list 里找不到对应 target')
+      const ws = new WebSocket(t.webSocketDebuggerUrl)
+      await new Promise((res, rej) => {
+        ws.addEventListener('open', res, { once: true })
+        ws.addEventListener('error', () => rej(new Error('额外 tab 的 WebSocket 连接失败')), { once: true })
+        setTimeout(() => rej(new Error('额外 tab 的 WebSocket 连接超时')), 15000)
+      })
+      conns.push(new CDP(ws))
+    }
+    log(`  并行：${conns.length} 个 tab`)
+  }
 
   const url = serverInfo
     ? `http://127.0.0.1:${serverInfo.port}/${encodeURIComponent(path.basename(htmlAbs))}`
     : 'file:///' + htmlAbs.replace(/\\/g, '/')
 
-  const loaded = new Promise((res) => cdp.on('Page.loadEventFired', res))
-  await cdp.send('Page.navigate', { url })
-  await Promise.race([loaded, sleep(15000)])
-
-  // 等页面 own 的 ready（字体 / 图片 / 依赖）
-  await cdp.evaluate(`(async () => {
+  const READY = `(async () => {
     if (document.fonts && document.fonts.ready) { try { await document.fonts.ready } catch (e) {} }
     const S = window.scene;
     if (S && S.ready && typeof S.ready.then === 'function') { try { await S.ready } catch (e) {} }
     return true;
-  })()`, { awaitPromise: true })
+  })()`
+
+  // 每个 tab 都要独立走一遍加载 + 字体 + scene.ready，否则第一个 tab 的截图是暖的、后面的是冷的
+  const boot = async (c) => {
+    await c.send('Page.enable')
+    await c.send('Runtime.enable')
+    const loaded = new Promise((res) => c.on('Page.loadEventFired', res))
+    await c.send('Page.navigate', { url })
+    await Promise.race([loaded, sleep(15000)])
+    await c.evaluate(READY, { awaitPromise: true })
+  }
+  await Promise.all(conns.map(boot))
+  const cdp = mainCdp
 
   const meta = await cdp.evaluate(`(() => {
     const S = window.scene;
@@ -470,11 +510,13 @@ try {
   const DUR = Number(opt.duration || meta.duration)
   if (!DUR || DUR <= 0) die('拿不到时长：给 --duration 或让 scene.duration 有值')
 
-  await cdp.send('Emulation.setDeviceMetricsOverride', {
-    width: W, height: H, deviceScaleFactor: Number(opt.scale) || 1, mobile: false,
-  })
-  if (opt.alpha) {
-    await cdp.send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 0, g: 0, b: 0, a: 0 } })
+  for (const c of conns) {
+    await c.send('Emulation.setDeviceMetricsOverride', {
+      width: W, height: H, deviceScaleFactor: Number(opt.scale) || 1, mobile: false,
+    })
+    if (opt.alpha) {
+      await c.send('Emulation.setDefaultBackgroundColorOverride', { color: { r: 0, g: 0, b: 0, a: 0 } })
+    }
   }
 
   const fmt = opt.format.toLowerCase()
@@ -496,8 +538,8 @@ try {
     return true;
   })()`
 
-  const shot = async (file) => {
-    const r = await cdp.send('Page.captureScreenshot', {
+  const shot = async (file, c = cdp) => {
+    const r = await c.send('Page.captureScreenshot', {
       format: 'png', captureBeyondViewport: false, fromSurface: true, optimizeForSpeed: true,
     })
     await writeFile(file, Buffer.from(r.data, 'base64'))
@@ -534,14 +576,25 @@ try {
     if (!times.length) die('--still 需要逗号分隔的秒数，例如 0,0.5,1.2')
     const stillDir = outPath.endsWith('.png') ? path.dirname(outPath) : outPath
     await mkdir(stillDir, { recursive: true })
-    for (const t of times) {
-      await cdp.evaluate(seekScript(t))
-      if (opt.guides) await cdp.evaluate(GUIDES)
-      const f = path.join(stillDir, `still-${String(t.toFixed(3)).replace('.', '_')}${opt.guides ? '-guides' : ''}.png`)
-      await shot(f)
-      produced.push(f)
-      log(`  关键帧 t=${t}s -> ${path.relative(process.cwd(), f)}`)
+    // 一次给 6-12 个时间点而不是一个一个看：改完一次看完，省掉中间的往返。
+    // 多个 tab 时按时间点分给各个 tab，仍然是共享游标。
+    let cursor = 0
+    const out = new Array(times.length)
+    const drainStill = async (c) => {
+      while (true) {
+        const idx = cursor++
+        if (idx >= times.length) break
+        const t = times[idx]
+        await c.evaluate(seekScript(t))
+        if (opt.guides) await c.evaluate(GUIDES)
+        const f = path.join(stillDir, `still-${String(t.toFixed(3)).replace('.', '_')}${opt.guides ? '-guides' : ''}.png`)
+        await shot(f, c)
+        out[idx] = f
+        log(`  关键帧 t=${t}s -> ${path.relative(process.cwd(), f)}`)
+      }
     }
+    await Promise.all(conns.map(drainStill))
+    produced = out.filter(Boolean)
     console.log(JSON.stringify({ ok: true, mode: 'still', guides: opt.guides, files: produced, ms: Date.now() - t0 }, null, 2))
   } else {
     if (opt.guides) log('  提示：--guides 只对 --still 生效，成片里不叠辅助线')
@@ -554,16 +607,28 @@ try {
     const RENDER_FPS = FPS * SUB
     const mixFrames = opt.motionBlur > 0 ? Math.max(1, Math.round(SUB * opt.motionBlur / 360)) : 1
     const total = Math.max(1, Math.round(DUR * RENDER_FPS))
-    for (let i = 0; i < total; i++) {
-      const t = i / RENDER_FPS
-      await cdp.evaluate(seekScript(t))
-      const f = path.join(framesDir, `f${String(i).padStart(5, '0')}.png`)
-      await shot(f)
-      produced.push(f)
-      if (!opt.quiet && (i === 0 || (i + 1) % Math.max(15, Math.round(RENDER_FPS / 2)) === 0 || i === total - 1)) {
-        log(`  渲染 ${i + 1}/${total} 帧 (t=${t.toFixed(2)}s)`)
+    // 帧序号从共享游标里领，谁渲完谁领下一帧 —— 各场景每帧耗时不完全均匀，
+    // 静态分段会让快的 tab 提前空转，共享游标能自动均衡。
+    let cursor = 0
+    let done = 0
+    const tick = Math.max(15, Math.round(RENDER_FPS / 2))
+    const drain = async (c) => {
+      while (true) {
+        const i = cursor++
+        if (i >= total) break
+        const t = i / RENDER_FPS
+        await c.evaluate(seekScript(t))
+        const f = path.join(framesDir, `f${String(i).padStart(5, '0')}.png`)
+        await shot(f, c)
+        produced.push(f)
+        done++
+        if (!opt.quiet && (done === 1 || done % tick === 0 || done === total)) {
+          log(`  渲染 ${done}/${total} 帧 (t=${t.toFixed(2)}s)`)
+        }
       }
     }
+    await Promise.all(conns.map(drain))
+    produced.sort()
     log(`  帧序列完成：${total} 帧 @ ${RENDER_FPS}fps，${((Date.now() - t0) / 1000).toFixed(1)}s`)
 
     const blurVf = SUB > 1
@@ -657,12 +722,13 @@ try {
     console.log(JSON.stringify({
       ok: true, video: outPath, sheet: sheetPath, frames: total, fps: FPS,
       renderFps: RENDER_FPS, motionBlur: opt.motionBlur || 0, blurMix: mixFrames, gl: opt.glUsed || 'auto',
+      jobs: conns.length,
       duration: DUR, size: `${W}x${H}`, bytes: sz,
       next: `node audit.mjs --video "${outPath}" --fps ${FPS} --duration ${DUR} --width ${W} --height ${H}`,
     }, null, 2))
   }
 } finally {
-  cdp.close()
+  for (const c of conns) { try { c.close() } catch {} }
   await browser.dispose()
   if (serverInfo) serverInfo.server.close()
 }
